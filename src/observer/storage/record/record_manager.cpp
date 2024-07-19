@@ -417,7 +417,40 @@ bool RecordPageHandler::is_full() const { return page_header_->record_num >= pag
 RC PaxRecordPageHandler::insert_record(const char *data, RID *rid)
 {
   // your code here
-  exit(-1);
+  // 判断当前页是否已满 已满的话直接return
+  ASSERT(rw_mode_ != ReadWriteMode::READ_ONLY, 
+         "cannot insert record into page while the page is readonly");
+
+  if (page_header_->record_num == page_header_->record_capacity) {
+    LOG_WARN("Page is full, page_num %d:%d.", disk_buffer_pool_->file_desc(), frame_->page_num());
+    return RC::RECORD_NOMEM;
+  }
+
+  // 找到空闲位置
+  Bitmap bitmap(bitmap_, page_header_->record_capacity);
+  int index = bitmap.next_unsetted_bit(0);
+  bitmap.set_bit(index);
+  page_header_->record_num++;
+
+  int offset_ = 0;
+  for (int i = 0 ; i < page_header_->column_num; i++) {
+    // 听过初始块的位置和mini块数量获得data存在的位置
+    char *_data = get_field_data(index, i);
+    // char* _data = get_field_data(rid->slot_num,i);
+    memcpy(_data, data + offset_, get_field_len(i));
+    offset_ += get_field_len(i);
+  }
+  // 标记页面已经写入了磁盘中，则page为dirty
+  frame_->mark_dirty();
+
+  if (rid) {
+    rid->page_num = get_page_num();
+    rid->slot_num = index;
+  }
+
+  // LOG_TRACE("Insert record. rid page_num=%d, slot num=%d", get_page_num(), index);
+  return RC::SUCCESS;
+  // exit(-1);
 }
 
 RC PaxRecordPageHandler::delete_record(const RID *rid)
@@ -447,14 +480,74 @@ RC PaxRecordPageHandler::delete_record(const RID *rid)
 RC PaxRecordPageHandler::get_record(const RID &rid, Record &record)
 {
   // your code here
-  exit(-1);
+  // your code here
+  // 判断槽位位置是否大于页面容量
+  if (rid.slot_num >= page_header_->record_capacity) {
+    LOG_ERROR("Invalid slot_num %d, exceed page's record capacity, frame=%s, page_header=%s",
+              rid.slot_num, frame_->to_string().c_str(), page_header_->to_string().c_str());
+    return RC::RECORD_INVALID_RID;
+  }
+
+  // 判断页面中的该槽位是否为空
+  Bitmap bitmap(bitmap_, page_header_->record_capacity);
+  if (!bitmap.get_bit(rid.slot_num)) {
+    LOG_ERROR("Invalid slot_num:%d, slot is empty, page_num %d.", rid.slot_num, frame_->page_num());
+    return RC::RECORD_NOT_EXIST;
+  }
+  record.set_rid(rid);
+  char* data = new char[page_header_->record_real_size];
+  int offset_ = 0;
+  for (int i = 0; i < page_header_->column_num; i++) {
+    // 找到每一块数据的位置
+    char* _data = get_field_data(rid.slot_num, i);
+    memcpy(data + offset_, _data, get_field_len(i));
+    offset_ += get_field_len(i);
+  }
+  record.copy_data(data, page_header_->record_real_size);
+  delete[] data; 
+  return RC::SUCCESS;
 }
 
+// autor：look
 // TODO: specify the column_ids that chunk needed. currenly we get all columns
+// RC PaxRecordPageHandler::get_chunk(Chunk &chunk)
+// {
+//   // your code here
+//   // 快最大的列数大于当前的页面最大的列数
+//   if (chunk.column_num() > page_header_->column_num) {
+//     LOG_ERROR("Invalid  column_num %d", chunk.column_num());
+//   }
+//   for (int i = 0; i < chunk.column_num(); i++) {
+//     int index = chunk.column_ids(i);
+//     // 这个slotNum 槽位是多少?是0吧？？
+//     char* data = get_field_data(0, index);
+//     // 有多少条记录，每一个minipax就有多少个值，即一列的值都在
+//     char* _data = new char[get_field_len(index) * page_header_->record_num];
+//     memcpy(_data, data, get_field_len(index) * page_header_->record_num);
+//     unique_ptr<Column> _data_colo(new Column(AttrType::UNDEFINED, get_field_len(index), page_header_->record_num));
+//     _data_colo->append(_data, page_header_->record_num);
+//     chunk.add_column(std::move(_data_colo), index);
+//   }
+//   return RC::SUCCESS;
+//   // exit(-1);
+// }
+
+//autor：zhanpan
 RC PaxRecordPageHandler::get_chunk(Chunk &chunk)
 {
-  // your code here
-  exit(-1);
+  Bitmap bitmap(bitmap_, page_header_->record_capacity);
+  for(int i=0;i<chunk.column_num();i++)
+  {
+    int id_ = chunk.column_ids((size_t)i);
+    int index = 0;
+    for(int q=0;q<page_header_->record_num;q++)
+    {
+      index = bitmap.next_setted_bit(index);
+      chunk.column(i).append_one(get_field_data(index,id_));
+      index++;
+    }
+   }
+   return RC::SUCCESS;
 }
 
 char *PaxRecordPageHandler::get_field_data(SlotNum slot_num, int col_id)
